@@ -188,7 +188,8 @@ where
         // first things first, let's walk over each of our previous
         // inputs and check whether they are out of date.
         if let Some(memo) = &mut panic_guard.memo {
-            if let Some(value) = memo.validate_memoized_value(db, revision_now) {
+            let opt = memo.validate_memoized_value(db, revision_now, format!("{:?}", self));
+            if let Some(value) = opt {
                 info!("{:?}: validated old memoized value", self,);
 
                 db.salsa_event(|| Event {
@@ -737,6 +738,7 @@ where
         &mut self,
         db: &DB,
         revision_now: Revision,
+        caller: String,
     ) -> Option<StampedValue<Q::Value>> {
         // If we don't have a memoized value, nothing to validate.
         if self.value.is_none() {
@@ -775,10 +777,24 @@ where
             // are only interested in finding out whether the
             // input changed *again*.
             MemoInputs::Tracked { inputs } => {
+                use std::io::{stderr, Write};
+                use std::time::Instant;
+                let inst_probe = Instant::now();
                 let changed_input = inputs
                     .iter()
                     .filter(|input| input.maybe_changed_since(db, verified_at))
                     .next();
+                let elapsed = inst_probe.elapsed().as_millis();
+                if elapsed > 20 {
+                    writeln!(
+                        stderr(),
+                        "[salsa] validate_memoized_value: caller={:?} going over {} tracked inputs took: {}ms",
+                        caller,
+                        inputs.len(),
+                        elapsed
+                    )
+                    .unwrap();
+                }
 
                 if let Some(input) = changed_input {
                     debug!(
