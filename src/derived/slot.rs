@@ -15,14 +15,55 @@ use crate::runtime::Runtime;
 use crate::runtime::RuntimeId;
 use crate::runtime::StampedValue;
 use crate::{CycleError, Database, DiscardIf, DiscardWhat, Event, EventKind, SweepStrategy};
-use log::{debug, info};
+use log::{debug, info, warn};
 use parking_lot::Mutex;
 use parking_lot::RwLock;
 use smallvec::SmallVec;
+use std::cell::RefCell;
 use std::marker::PhantomData;
 use std::ops::Deref;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
+
+thread_local!(static PROFILE_COUNTER: RefCell<i32> = RefCell::new(-1));
+
+enum Counter {
+    Active(String),
+    Inactive,
+}
+
+impl Drop for Counter {
+    fn drop(&mut self) {
+        if let Counter::Active(desc) = self {
+            PROFILE_COUNTER.with(|cell| {
+                let mut cnt = cell.borrow_mut();
+                if *cnt > 0 {
+                    use std::io::{stderr, Write};
+                    writeln!(
+                        stderr(),
+                        "### number of visited transitive deps for {} was: {}",
+                        desc,
+                        *cnt
+                    )
+                    .unwrap();
+                }
+                *cnt = -1;
+            });
+        }
+    }
+}
+
+fn profile(self_desc: String) -> Counter {
+    PROFILE_COUNTER.with(|cell| {
+        let mut cnt = cell.borrow_mut();
+        if *cnt == -1 && self_desc.contains("CrateDefMap") {
+            *cnt = 0;
+            Counter::Active(self_desc)
+        } else {
+            Counter::Inactive
+        }
+    })
+}
 
 pub(super) struct Slot<DB, Q, MP>
 where
@@ -129,6 +170,8 @@ where
         &self,
         db: &DB,
     ) -> Result<StampedValue<Q::Value>, CycleError<DB::DatabaseKey>> {
+        let _p = profile(format!("{:?}", self));
+
         let runtime = db.salsa_runtime();
 
         // NB: We don't need to worry about people modifying the
@@ -188,7 +231,9 @@ where
         // first things first, let's walk over each of our previous
         // inputs and check whether they are out of date.
         if let Some(memo) = &mut panic_guard.memo {
-            if let Some(value) = memo.validate_memoized_value(db, revision_now) {
+            if let Some(value) =
+                memo.validate_memoized_value(db, revision_now, format!("{:?}", self))
+            {
                 info!("{:?}: validated old memoized value", self,);
 
                 db.salsa_event(|| Event {
@@ -737,6 +782,7 @@ where
         &mut self,
         db: &DB,
         revision_now: Revision,
+        caller_str: String,
     ) -> Option<StampedValue<Q::Value>> {
         // If we don't have a memoized value, nothing to validate.
         if self.value.is_none() {
@@ -746,6 +792,21 @@ where
         assert!(self.verified_at != revision_now);
         let verified_at = self.verified_at;
 
+        let should_log = PROFILE_COUNTER.with(|cell| {
+            let mut cnt = cell.borrow_mut();
+            if *cnt >= 0 {
+                *cnt += 1;
+            }
+            *cnt > 0
+        });
+
+        if should_log {
+            warn!(
+                "validate_memoized_value({:?}) revision_now={:?} verified_at={:?} changed_at={:?} durability={:?}",
+                caller_str, revision_now, verified_at, self.changed_at, self.durability
+            );
+        }
+
         debug!(
             "validate_memoized_value({:?}): verified_at={:#?}",
             Q::default(),
@@ -753,6 +814,9 @@ where
         );
 
         if self.check_durability(db) {
+            if should_log {
+                warn!("validate_memoized_value({:?}) not changed", caller_str);
+            }
             return Some(self.mark_value_as_verified(revision_now));
         }
 
@@ -760,6 +824,12 @@ where
             // We can't validate values that had untracked inputs; just have to
             // re-execute.
             MemoInputs::Untracked { .. } => {
+                if should_log {
+                    warn!(
+                        "validate_memoized_value({:?}) CHANGED untracked",
+                        caller_str
+                    );
+                }
                 return None;
             }
 
@@ -775,6 +845,13 @@ where
             // are only interested in finding out whether the
             // input changed *again*.
             MemoInputs::Tracked { inputs } => {
+                if should_log {
+                    warn!(
+                        "validate_memoized_value({:?}) will process {} inputs",
+                        caller_str,
+                        inputs.len()
+                    );
+                }
                 let changed_input = inputs
                     .iter()
                     .filter(|input| input.maybe_changed_since(db, verified_at))
@@ -786,11 +863,20 @@ where
                         Q::default(),
                         input
                     );
+                    if should_log {
+                        warn!(
+                            "validate_memoized_value({:?}) CHANGED input={:?}",
+                            caller_str, input
+                        );
+                    }
 
                     return None;
                 }
             }
         };
+        if should_log {
+            warn!("validate_memoized_value({:?}) not changed", caller_str);
+        }
 
         Some(self.mark_value_as_verified(revision_now))
     }
